@@ -18,6 +18,16 @@ ProgressCallback = Callable[[str], None]
 TextDeltaCallback = Callable[[str], None]
 
 
+VOICE_PRINT_SMALL_CONTEXT_CHARS = 12000
+VOICE_PRINT_LARGE_CONTEXT_CHARS = 50000
+VOICE_PRINT_SYNTHESIS_CONTEXT_CHARS = 30000
+ARTICLE_SMALL_CONTEXT_CHARS = 12000
+ARTICLE_LARGE_CONTEXT_CHARS = 50000
+ARTICLE_SMALL_SYNTHESIS_CONTEXT_CHARS = 10000
+ARTICLE_LARGE_SYNTHESIS_CONTEXT_CHARS = 30000
+ARTICLE_CONTINUATION_CONTEXT_CHARS = 12000
+
+
 class OpenAIConfigurationError(RuntimeError):
     pass
 
@@ -103,6 +113,7 @@ class ArticleGenerator:
                 model=model,
                 instructions=instructions,
                 content=content,
+                max_output_tokens=token_budget,
                 on_progress=on_progress,
                 on_text_delta=on_text_delta,
             )
@@ -192,6 +203,7 @@ class ArticleGenerator:
         model: str,
         instructions: str,
         content: list[dict],
+        max_output_tokens: int,
         on_progress: ProgressCallback | None = None,
         on_text_delta: TextDeltaCallback | None = None,
     ) -> str:
@@ -207,6 +219,8 @@ class ArticleGenerator:
             ],
             "stream": bool(on_text_delta),
         }
+        if max_output_tokens:
+            payload["options"] = {"num_predict": max_output_tokens}
         url = _ollama_native_url(self.model_settings.base_url)
         if on_progress:
             on_progress("Connecting to Ollama.")
@@ -313,6 +327,17 @@ Safety and integrity rules:
 - Preserve attribution discipline and flag uncertainty.
 - Keep the guidance usable as a prompt wrapper for first-draft article generation.
 """.strip()
+        sample_context = sample_context.strip()
+        text_chunks = _split_text_chunks(sample_context, self._voice_print_chunk_chars())
+        if len(text_chunks) > 1:
+            if on_progress:
+                on_progress(f"Analyzing samples in {len(text_chunks)} smaller chunks for this model.")
+            sample_context = self._summarize_voice_print_chunks(
+                chunks=text_chunks,
+                author_notes=author_notes,
+                on_progress=on_progress,
+            )
+
         prompt = f"""
 Analyze {sample_count} uploaded sample file(s) and produce a Voice Print.
 
@@ -352,6 +377,91 @@ Sample text:
             on_text_delta=on_text_delta,
         )
 
+    def _voice_print_chunk_chars(self) -> int:
+        if self.model_settings.provider in {"ollama", "custom"} or self.model_settings.api_mode in {
+            "chat",
+            "ollama_native",
+        }:
+            return VOICE_PRINT_SMALL_CONTEXT_CHARS
+        return VOICE_PRINT_LARGE_CONTEXT_CHARS
+
+    def _summarize_voice_print_chunks(
+        self,
+        *,
+        chunks: list[str],
+        author_notes: str,
+        on_progress: ProgressCallback | None,
+    ) -> str:
+        analyses: list[str] = []
+        total = len(chunks)
+        for index, chunk in enumerate(chunks, start=1):
+            if on_progress:
+                on_progress(f"Analyzing Voice Print chunk {index} of {total}.")
+            analyses.append(
+                self._analyze_voice_print_chunk(
+                    chunk=chunk,
+                    author_notes=author_notes,
+                    label=f"sample chunk {index}/{total}",
+                )
+            )
+
+        combined = "\n\n".join(analyses).strip()
+        round_number = 1
+        while len(combined) > VOICE_PRINT_SYNTHESIS_CONTEXT_CHARS:
+            reduction_chunks = _split_text_chunks(combined, VOICE_PRINT_SYNTHESIS_CONTEXT_CHARS)
+            reduced: list[str] = []
+            if on_progress:
+                on_progress(f"Condensing Voice Print notes for small-context synthesis, pass {round_number}.")
+            for index, chunk in enumerate(reduction_chunks, start=1):
+                reduced.append(
+                    self._analyze_voice_print_chunk(
+                        chunk=chunk,
+                        author_notes=author_notes,
+                        label=f"condensed notes {index}/{len(reduction_chunks)}",
+                    )
+                )
+            combined = "\n\n".join(reduced).strip()
+            round_number += 1
+
+        return f"""
+Condensed style evidence from chunked sample analysis:
+
+{combined or "[No text notes were produced from the uploaded samples.]"}
+""".strip()
+
+    def _analyze_voice_print_chunk(self, *, chunk: str, author_notes: str, label: str) -> str:
+        instructions = """
+You are a newsroom style analyst. Analyze one limited-context slice of an authorized journalist's writing samples.
+
+Return compact notes only. Do not write the final Voice Print. Do not copy memorable phrases from the samples.
+Focus on durable, reusable patterns in structure, paragraphing, sentence rhythm, attribution, ledes, transitions, endings, diction, and boundaries.
+""".strip()
+        prompt = f"""
+Analyze this {label} for reusable Voice Print evidence.
+
+Author notes:
+{author_notes.strip() or "None provided."}
+
+Return concise bullets under these headings:
+- Architecture
+- Rhythm
+- Tone and distance
+- Reporting and attribution
+- Diction
+- Ledes and endings
+- Do
+- Do not
+
+Sample slice:
+{chunk}
+""".strip()
+        return self._responses_create(
+            model=self.model_settings.voice_model,
+            instructions=instructions,
+            content=[{"type": "input_text", "text": prompt}],
+            max_output_tokens=min(self.model_settings.max_output_tokens, 1800),
+        )
+
     def generate_article(
         self,
         *,
@@ -367,7 +477,13 @@ Sample text:
         on_text_delta: TextDeltaCallback | None = None,
     ) -> str:
         word_count = max(250, min(self.config.article_max_words, int(word_count)))
-        if word_count >= self.config.article_parallel_threshold_words:
+        source_context = self._prepare_article_source_context(
+            title=title,
+            source_context=source_context,
+            user_instructions=user_instructions,
+            on_progress=on_progress,
+        )
+        if self._should_generate_article_parallel(word_count):
             return self._generate_article_parallel(
                 title=title,
                 source_context=source_context,
@@ -409,6 +525,129 @@ Sample text:
                 on_progress=on_progress,
                 on_text_delta=on_text_delta,
             )
+
+    def _should_generate_article_parallel(self, word_count: int) -> bool:
+        if self._small_context_model() and word_count >= 1200:
+            return True
+        return word_count >= self.config.article_parallel_threshold_words
+
+    def _small_context_model(self) -> bool:
+        return self.model_settings.provider in {"ollama", "custom"} or self.model_settings.api_mode in {
+            "chat",
+            "ollama_native",
+        }
+
+    def _article_source_chunk_chars(self) -> int:
+        return ARTICLE_SMALL_CONTEXT_CHARS if self._small_context_model() else ARTICLE_LARGE_CONTEXT_CHARS
+
+    def _article_synthesis_context_chars(self) -> int:
+        if self._small_context_model():
+            return ARTICLE_SMALL_SYNTHESIS_CONTEXT_CHARS
+        return ARTICLE_LARGE_SYNTHESIS_CONTEXT_CHARS
+
+    def _voice_print_prompt_text(self, voice_print: str | None) -> str:
+        if not voice_print:
+            return "No Voice Print selected. Use a neutral professional newsroom voice."
+        if not self._small_context_model():
+            return voice_print.strip()
+        return _limit_text(voice_print, 6000, "Voice Print truncated for context budget.")
+
+    def _prepare_article_source_context(
+        self,
+        *,
+        title: str,
+        source_context: str,
+        user_instructions: str,
+        on_progress: ProgressCallback | None,
+    ) -> str:
+        source_context = source_context.strip()
+        chunks = _split_text_chunks(source_context, self._article_source_chunk_chars())
+        if len(chunks) <= 1:
+            return source_context
+
+        if on_progress:
+            on_progress(f"Analyzing source material in {len(chunks)} smaller chunks for this model.")
+
+        briefs: list[str] = []
+        for index, chunk in enumerate(chunks, start=1):
+            if on_progress:
+                on_progress(f"Building source brief chunk {index} of {len(chunks)}.")
+            briefs.append(
+                self._analyze_article_source_chunk(
+                    title=title,
+                    chunk=chunk,
+                    user_instructions=user_instructions,
+                    label=f"source chunk {index}/{len(chunks)}",
+                )
+            )
+
+        combined = "\n\n".join(briefs).strip()
+        pass_number = 1
+        synthesis_chars = self._article_synthesis_context_chars()
+        while len(combined) > synthesis_chars:
+            reduction_chunks = _split_text_chunks(combined, synthesis_chars)
+            reduced: list[str] = []
+            if on_progress:
+                on_progress(f"Condensing article source brief for small-context drafting, pass {pass_number}.")
+            for index, chunk in enumerate(reduction_chunks, start=1):
+                reduced.append(
+                    self._analyze_article_source_chunk(
+                        title=title,
+                        chunk=chunk,
+                        user_instructions=user_instructions,
+                        label=f"source brief notes {index}/{len(reduction_chunks)}",
+                    )
+                )
+            combined = "\n\n".join(reduced).strip()
+            pass_number += 1
+
+        return f"""
+Condensed source brief from chunked source analysis:
+
+{combined or "[No source brief could be produced from the uploaded material.]"}
+""".strip()
+
+    def _analyze_article_source_chunk(
+        self,
+        *,
+        title: str,
+        chunk: str,
+        user_instructions: str,
+        label: str,
+    ) -> str:
+        instructions = """
+You are a careful newsroom research editor analyzing one limited-context slice of source material.
+
+Return compact factual notes only. Use only this source slice and explicit user instructions. Do not invent facts, quotes, names, dates, numbers, chronology, or causal links.
+Preserve exact names, dates, figures, quote fragments, caveats, contradictions, and verification gaps when present.
+""".strip()
+        prompt = f"""
+Article title/topic:
+{title.strip() or "Untitled draft"}
+
+User instructions:
+{user_instructions.strip() or "Write the strongest news-style first draft supported by the uploaded material."}
+
+Analyze this {label}.
+
+Return concise bullets under these headings:
+- Key facts and claims
+- Named people and organizations
+- Timeline and dates
+- Numbers and data
+- Quotes or attributed statements
+- Caveats, conflicts, and verification gaps
+- Possible article angles
+
+Source slice:
+{chunk}
+""".strip()
+        return self._responses_create(
+            model=self.model_settings.model,
+            instructions=instructions,
+            content=[{"type": "input_text", "text": prompt}],
+            max_output_tokens=min(self.model_settings.max_output_tokens, 2200),
+        )
 
     def _generate_article_single(
         self,
@@ -463,6 +702,8 @@ Sample text:
         section_count = max(2, math.ceil(word_count / max(500, self.config.article_section_target_words)))
         section_count = min(section_count, 12)
         workers = max(1, min(self.config.article_parallel_max_workers, section_count))
+        if self._small_context_model():
+            workers = 1
 
         if on_progress:
             on_progress(f"Building source brief and {section_count}-section plan.")
@@ -580,7 +821,7 @@ Voice Print strength:
 {tone_strength}/100
 
 Voice Print:
-{voice_print.strip() if voice_print else "No Voice Print selected. Use a neutral professional newsroom voice."}
+{self._voice_print_prompt_text(voice_print)}
 
 Source material:
 {source_context or "[No extractable text. Use image inputs if provided.]"}
@@ -609,7 +850,7 @@ Return JSON in this shape:
                 model=self.model_settings.model,
                 instructions=instructions,
                 content=content,
-                max_output_tokens=max(7000, min(self.config.max_output_tokens, 14000)),
+                max_output_tokens=self._article_plan_output_budget(),
             )
             return _json_object(raw)
         except Exception:
@@ -662,7 +903,7 @@ User instructions:
 {user_instructions.strip() or "Write the strongest news-style first draft supported by the uploaded material."}
 
 Voice Print:
-{voice_print.strip() if voice_print else "No Voice Print selected. Use a neutral professional newsroom voice."}
+{self._voice_print_prompt_text(voice_print)}
 
 Full outline:
 {outline_text}
@@ -683,7 +924,7 @@ Return this section only. Use a markdown heading for the section unless this is 
                 model=self.model_settings.model,
                 instructions=instructions,
                 content=[{"type": "input_text", "text": prompt}],
-                max_output_tokens=max(4000, int(target_words * 4) + 2000),
+                max_output_tokens=self._section_output_budget(target_words),
             )
         except OpenAIResponseIncompleteError as exc:
             continuation = self._continue_section(
@@ -709,7 +950,7 @@ Section {section["number"]} of {section_count}: {section["heading"]}
 Target section words: {section["target_words"]}
 
 Partial section:
-{partial_section}
+{_tail_text(partial_section, ARTICLE_CONTINUATION_CONTEXT_CHARS)}
 
 Source brief:
 {source_brief}
@@ -718,7 +959,7 @@ Source brief:
             model=self.model_settings.model,
             instructions="Continue an incomplete article section without repeating previous text.",
             content=[{"type": "input_text", "text": prompt}],
-            max_output_tokens=max(3000, int(section["target_words"]) * 3 + 2000),
+            max_output_tokens=self._section_continuation_output_budget(int(section["target_words"])),
         )
 
     def _continue_article(
@@ -758,8 +999,8 @@ Title/topic:
 Target total length:
 {word_count} words.
 
-Current draft:
-{article}
+Recent draft context:
+{_tail_text(article, ARTICLE_CONTINUATION_CONTEXT_CHARS)}
 
 Write about {remaining_words} additional words.
 
@@ -770,7 +1011,7 @@ Voice Print strength:
 {tone_strength}/100
 
 Voice Print:
-{voice_print.strip() if voice_print else "No Voice Print selected. Use a neutral professional newsroom voice."}
+{self._voice_print_prompt_text(voice_print)}
 
 Source material:
 {source_context}
@@ -782,7 +1023,7 @@ Source material:
                     model=self.model_settings.model,
                     instructions="Continue an incomplete newsroom article draft without repeating previous copy.",
                     content=[{"type": "input_text", "text": prompt}],
-                    max_output_tokens=max(2500, int(remaining_words * 3)),
+                    max_output_tokens=self._continuation_output_budget(remaining_words),
                 )
             except OpenAIResponseIncompleteError as exc:
                 addition = exc.partial_text
@@ -835,7 +1076,7 @@ User instructions:
 {user_instructions.strip() or "Write the strongest news-style first draft supported by the uploaded material."}
 
 Voice Print:
-{voice_print.strip() if voice_print else "No Voice Print selected. Use a neutral professional newsroom voice."}
+{self._voice_print_prompt_text(voice_print)}
 
 Source material:
 {source_context or "[No extractable text. Use image inputs if provided.]"}
@@ -847,7 +1088,32 @@ Output instruction:
 
     def _article_output_budget(self, word_count: int) -> int:
         estimated = int(word_count * 3.2) + 5000
+        if self._small_context_model():
+            return max(2500, min(self.model_settings.max_output_tokens, estimated, 6000))
         return max(self.config.max_output_tokens, estimated)
+
+    def _article_plan_output_budget(self) -> int:
+        if self._small_context_model():
+            return max(2500, min(self.model_settings.max_output_tokens, 5000))
+        return max(7000, min(self.config.max_output_tokens, 14000))
+
+    def _section_output_budget(self, target_words: int) -> int:
+        estimated = int(target_words * 3.5) + 1500
+        if self._small_context_model():
+            return max(2200, min(self.model_settings.max_output_tokens, estimated, 4500))
+        return max(4000, int(target_words * 4) + 2000)
+
+    def _section_continuation_output_budget(self, target_words: int) -> int:
+        estimated = int(target_words * 2.5) + 1000
+        if self._small_context_model():
+            return max(1800, min(self.model_settings.max_output_tokens, estimated, 3500))
+        return max(3000, int(target_words) * 3 + 2000)
+
+    def _continuation_output_budget(self, remaining_words: int) -> int:
+        estimated = int(remaining_words * 3) + 800
+        if self._small_context_model():
+            return max(1800, min(self.model_settings.max_output_tokens, estimated, 3500))
+        return max(2500, int(remaining_words * 3))
 
 
 def _extract_response_text(response) -> str:
@@ -903,6 +1169,62 @@ def _openai_compatible_base_url(base_url: str) -> str:
     if url.endswith(suffix):
         return url[: -len(suffix)]
     return url
+
+
+def _split_text_chunks(text: str, max_chars: int) -> list[str]:
+    clean = text.strip()
+    if not clean:
+        return []
+    max_chars = max(1000, max_chars)
+    paragraphs = re.split(r"\n{2,}", clean)
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    def flush() -> None:
+        nonlocal current, current_len
+        if current:
+            chunks.append("\n\n".join(current).strip())
+            current = []
+            current_len = 0
+
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        if len(paragraph) > max_chars:
+            flush()
+            for start in range(0, len(paragraph), max_chars):
+                chunks.append(paragraph[start : start + max_chars].strip())
+            continue
+        separator_len = 2 if current else 0
+        if current and current_len + separator_len + len(paragraph) > max_chars:
+            flush()
+        current.append(paragraph)
+        current_len += separator_len + len(paragraph)
+
+    flush()
+    return chunks
+
+
+def _tail_text(text: str, max_chars: int) -> str:
+    clean = text.strip()
+    if len(clean) <= max_chars:
+        return clean
+    prefix = "[Earlier draft omitted for context budget. Continue from the end of this excerpt.]\n\n"
+    tail = clean[-max(1, max_chars - len(prefix)) :]
+    paragraph_break = tail.find("\n\n")
+    if paragraph_break > 0:
+        tail = tail[paragraph_break + 2 :]
+    return f"{prefix}{tail.strip()}"
+
+
+def _limit_text(text: str, max_chars: int, note: str) -> str:
+    clean = text.strip()
+    if len(clean) <= max_chars:
+        return clean
+    prefix = f"[{note}]\n\n"
+    return f"{prefix}{clean[: max(1, max_chars - len(prefix))].strip()}"
 
 
 def _raise_if_response_not_complete(response, partial_text: str) -> None:
