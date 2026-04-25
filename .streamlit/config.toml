@@ -1,0 +1,11 @@
+[theme]
+primaryColor = "#176B87"
+backgroundColor = "#F7F7F2"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#17212B"
+font = "sans serif"
+
+[server]
+# Streamlit requires this to be a finite MB value; the app no longer applies
+# its own upload-size checks.
+maxUploadSize = 102400

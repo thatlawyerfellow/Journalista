@@ -1,0 +1,2 @@
+"""Article Generator application package."""
+
