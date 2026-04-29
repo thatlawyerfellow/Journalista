@@ -56,6 +56,7 @@ ZIP_EXTENSIONS = {".zip"}
 SUPPORTED_EXTENSIONS = sorted(DOCUMENT_EXTENSIONS | IMAGE_EXTENSIONS | ZIP_EXTENSIONS)
 MAX_NESTED_ZIP_DEPTH = 8
 IngestProgressCallback = Callable[[str], None]
+IngestProgressEventCallback = Callable[[str, int, int], None]
 
 
 @dataclass
@@ -105,13 +106,64 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + "\n\n[Truncated for context budget.]"
 
 
-def _parse_pdf(data: bytes) -> str:
-    reader = PdfReader(io.BytesIO(data))
+def _emit_progress(
+    callback: IngestProgressEventCallback | None,
+    message: str,
+    completed: int,
+    total: int,
+) -> None:
+    if callback:
+        callback(message, max(0, completed), max(1, total))
+
+
+def _parse_pdf(
+    data: bytes,
+    *,
+    max_chars: int,
+    display_name: str,
+    progress_event_callback: IngestProgressEventCallback | None = None,
+) -> str:
+    reader = PdfReader(io.BytesIO(data), strict=False)
+    if reader.is_encrypted:
+        decrypt_result = reader.decrypt("")
+        if decrypt_result == 0:
+            raise ValueError("Encrypted PDF requires a password.")
+
+    total_pages = len(reader.pages)
+    _emit_progress(progress_event_callback, f"Reading PDF: {display_name} (0/{total_pages} pages)", 0, total_pages)
     pages = []
+    extracted_chars = 0
     for index, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
+        _emit_progress(
+            progress_event_callback,
+            f"Reading PDF: {display_name} ({index}/{total_pages} pages)",
+            index - 1,
+            total_pages,
+        )
+        try:
+            text = page.extract_text() or ""
+        except Exception as exc:
+            pages.append(f"[Page {index}]\n[Could not extract text from this page: {exc}]")
+            _emit_progress(
+                progress_event_callback,
+                f"Skipped unreadable PDF page {index}/{total_pages}: {display_name}",
+                index,
+                total_pages,
+            )
+            continue
         if text.strip():
-            pages.append(f"[Page {index}]\n{text.strip()}")
+            page_text = f"[Page {index}]\n{text.strip()}"
+            pages.append(page_text)
+            extracted_chars += len(page_text)
+        _emit_progress(
+            progress_event_callback,
+            f"Read PDF page {index}/{total_pages}: {display_name}",
+            index,
+            total_pages,
+        )
+        if extracted_chars >= max_chars:
+            pages.append("[PDF text truncated after reaching the per-file context limit.]")
+            break
     return "\n\n".join(pages)
 
 
@@ -225,6 +277,7 @@ def _parse_file(
     display_name: str,
     stored_path: str | None,
     config: AppConfig,
+    progress_event_callback: IngestProgressEventCallback | None = None,
 ) -> IngestedItem:
     extension = Path(display_name).suffix.lower()
     try:
@@ -246,7 +299,12 @@ def _parse_file(
         elif extension == ".rtf":
             text = rtf_to_text(_decode_text(data))
         elif extension == ".pdf":
-            text = _parse_pdf(data)
+            text = _parse_pdf(
+                data,
+                max_chars=config.max_text_chars_per_file,
+                display_name=display_name,
+                progress_event_callback=progress_event_callback,
+            )
         elif extension == ".docx":
             text = _parse_docx(data)
         elif extension == ".pptx":
@@ -283,12 +341,21 @@ def ingest_uploads(
     user_id: int,
     purpose: str,
     progress_callback: IngestProgressCallback | None = None,
+    progress_event_callback: IngestProgressEventCallback | None = None,
 ) -> list[IngestedItem]:
     items: list[IngestedItem] = []
-    for uploaded in uploaded_files:
+    uploaded_list = list(uploaded_files)
+    total_uploads = max(1, len(uploaded_list))
+    for upload_index, uploaded in enumerate(uploaded_list, start=1):
         name = getattr(uploaded, "name", "upload")
         if progress_callback:
             progress_callback(f"Reading upload: {name}")
+        _emit_progress(
+            progress_event_callback,
+            f"Reading upload {upload_index}/{total_uploads}: {name}",
+            upload_index - 1,
+            total_uploads,
+        )
         data = uploaded.getvalue()
         stored_path = _write_upload(data, config.upload_dir, user_id, purpose, name)
         extension = Path(name).suffix.lower()
@@ -302,10 +369,17 @@ def ingest_uploads(
                     user_id=user_id,
                     purpose=purpose,
                     progress_callback=progress_callback,
+                    progress_event_callback=progress_event_callback,
                 )
             )
         else:
-            items.append(_parse_file(data, name, stored_path, config))
+            items.append(_parse_file(data, name, stored_path, config, progress_event_callback))
+        _emit_progress(
+            progress_event_callback,
+            f"Finished upload {upload_index}/{total_uploads}: {name}",
+            upload_index,
+            total_uploads,
+        )
     return items
 
 
@@ -318,6 +392,7 @@ def _ingest_zip(
     purpose: str,
     depth: int = 0,
     progress_callback: IngestProgressCallback | None = None,
+    progress_event_callback: IngestProgressEventCallback | None = None,
 ) -> list[IngestedItem]:
     items: list[IngestedItem] = []
     if depth > MAX_NESTED_ZIP_DEPTH:
@@ -333,7 +408,9 @@ def _ingest_zip(
         ]
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            for info in archive.infolist():
+            entries = archive.infolist()
+            total_entries = max(1, len(entries))
+            for entry_index, info in enumerate(entries, start=1):
                 safe_name = _safe_zip_name(info.filename, info.is_dir())
                 if safe_name is None:
                     continue
@@ -341,6 +418,12 @@ def _ingest_zip(
                 nested_name = f"{archive_name}/{safe_name}"
                 if progress_callback:
                     progress_callback(f"Unzipping: {nested_name}")
+                _emit_progress(
+                    progress_event_callback,
+                    f"Unzipping {entry_index}/{total_entries}: {nested_name}",
+                    entry_index - 1,
+                    total_entries,
+                )
                 try:
                     with archive.open(info) as file_handle:
                         file_data = file_handle.read()
@@ -369,6 +452,7 @@ def _ingest_zip(
                             purpose=purpose,
                             depth=depth + 1,
                             progress_callback=progress_callback,
+                            progress_event_callback=progress_event_callback,
                         )
                     )
                     continue
@@ -386,7 +470,13 @@ def _ingest_zip(
                     )
                     continue
                 nested_path = _write_upload(file_data, config.upload_dir, user_id, purpose, nested_name)
-                items.append(_parse_file(file_data, nested_name, nested_path, config))
+                items.append(_parse_file(file_data, nested_name, nested_path, config, progress_event_callback))
+                _emit_progress(
+                    progress_event_callback,
+                    f"Finished zip entry {entry_index}/{total_entries}: {nested_name}",
+                    entry_index,
+                    total_entries,
+                )
     except zipfile.BadZipFile:
         items.append(
             IngestedItem(

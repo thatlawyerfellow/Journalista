@@ -572,14 +572,18 @@ Sample slice:
         for index, chunk in enumerate(chunks, start=1):
             if on_progress:
                 on_progress(f"Building source brief chunk {index} of {len(chunks)}.")
-            briefs.append(
-                self._analyze_article_source_chunk(
+            try:
+                brief = self._analyze_article_source_chunk(
                     title=title,
                     chunk=chunk,
                     user_instructions=user_instructions,
                     label=f"source chunk {index}/{len(chunks)}",
                 )
-            )
+            except OpenAIResponseIncompleteError as exc:
+                brief = exc.partial_text
+                if on_progress:
+                    on_progress(f"Source brief chunk {index} hit the output limit; using partial notes.")
+            briefs.append(brief)
 
         combined = "\n\n".join(briefs).strip()
         pass_number = 1
@@ -590,14 +594,20 @@ Sample slice:
             if on_progress:
                 on_progress(f"Condensing article source brief for small-context drafting, pass {pass_number}.")
             for index, chunk in enumerate(reduction_chunks, start=1):
-                reduced.append(
-                    self._analyze_article_source_chunk(
+                try:
+                    brief = self._analyze_article_source_chunk(
                         title=title,
                         chunk=chunk,
                         user_instructions=user_instructions,
                         label=f"source brief notes {index}/{len(reduction_chunks)}",
                     )
-                )
+                except OpenAIResponseIncompleteError as exc:
+                    brief = exc.partial_text
+                    if on_progress:
+                        on_progress(
+                            f"Source brief condensation chunk {index} hit the output limit; using partial notes."
+                        )
+                reduced.append(brief)
             combined = "\n\n".join(reduced).strip()
             pass_number += 1
 
@@ -638,6 +648,8 @@ Return concise bullets under these headings:
 - Quotes or attributed statements
 - Caveats, conflicts, and verification gaps
 - Possible article angles
+
+Keep the entire response under 900 words. Prefer compact fragments over prose.
 
 Source slice:
 {chunk}

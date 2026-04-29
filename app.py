@@ -116,6 +116,39 @@ def summarize_ingested_items(items: list) -> dict[str, int]:
     }
 
 
+def make_ingest_progress_callback(
+    tracker: GenerationProgress,
+    *,
+    step_index: int,
+    start_percent: int,
+    end_percent: int,
+):
+    def progress(message: str, completed: int, total: int) -> None:
+        total = max(1, total)
+        completed = max(0, min(completed, total))
+        percent = start_percent + int((end_percent - start_percent) * completed / total)
+        tracker.note(message)
+        tracker.update(step_index, percent, message)
+
+    return progress
+
+
+def progress_from_fraction(start: int, end: int, completed: int, total: int) -> int:
+    total = max(1, total)
+    completed = max(0, min(completed, total))
+    return start + int((end - start) * completed / total)
+
+
+def parse_fraction(message: str) -> tuple[int, int] | None:
+    match = re.search(r"\b(\d+)\s+of\s+(\d+)\b", message)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    match = re.search(r"\b(\d+)/(\d+)\b", message)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return None
+
+
 def current_user() -> dict | None:
     user_id = st.session_state.get("user_id")
     if not user_id:
@@ -235,6 +268,12 @@ def voice_print_page(user: dict) -> None:
                     user["id"],
                     "voice-samples",
                     progress_callback=tracker.note,
+                    progress_event_callback=make_ingest_progress_callback(
+                        tracker,
+                        step_index=1,
+                        start_percent=15,
+                        end_percent=30,
+                    ),
                 )
                 manifest = build_manifest(items)
                 summary = summarize_ingested_items(items)
@@ -408,6 +447,12 @@ def draft_article_page(user: dict) -> None:
                 user["id"],
                 "article-sources",
                 progress_callback=tracker.note,
+                progress_event_callback=make_ingest_progress_callback(
+                    tracker,
+                    step_index=1,
+                    start_percent=15,
+                    end_percent=30,
+                ),
             )
             manifest = build_manifest(items)
             readable = [item for item in items if not item.error and (item.text.strip() or item.image_data_url)]
@@ -440,8 +485,31 @@ def draft_article_page(user: dict) -> None:
             last_render = {"chars": 0, "words": 0}
 
             def openai_progress(message: str) -> None:
-                step_index = 3 if "Connecting" in message or "accepted" in message else 4
-                percent = 54 if step_index == 3 else max(tracker.percent, 58)
+                fraction = parse_fraction(message)
+                if "source material" in message or "source brief chunk" in message:
+                    step_index = 2
+                    percent = progress_from_fraction(49, 56, *fraction) if fraction else 50
+                elif "Condensing article source brief" in message:
+                    step_index = 2
+                    percent = max(tracker.percent, 56)
+                elif "Connecting" in message or "accepted" in message:
+                    step_index = 3
+                    percent = 57
+                elif "Building source brief and" in message:
+                    step_index = 4
+                    percent = 60
+                elif "Parallel drafting" in message:
+                    step_index = 4
+                    percent = 62
+                elif "Section" in message and "drafted" in message and fraction:
+                    step_index = 4
+                    percent = progress_from_fraction(64, 86, *fraction)
+                elif "Draft is short" in message or "finished writing text" in message:
+                    step_index = 4
+                    percent = max(tracker.percent, 86)
+                else:
+                    step_index = 4
+                    percent = max(tracker.percent, 58)
                 tracker.update(step_index, percent, message)
 
             def article_delta(delta: str) -> None:
